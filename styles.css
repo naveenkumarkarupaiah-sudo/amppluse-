@@ -1,0 +1,133 @@
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+:root {
+  --bg-cream: #FAF7F2;
+  --card-bg: #FFFFFF;
+  --card-border: #EAE6DF;
+  --text-main: #1E293B;
+  --text-muted: #64748B;
+  --accent-yellow: #FACC15;
+  --accent-emerald: #10B981;
+  --accent-cyan: #06B6D4;
+  --accent-amber: #F59E0B;
+  --accent-red: #EF4444;
+  --pill-active-bg: #0F172A;
+}
+
+body {
+  font-family: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif;
+  background-color: var(--bg-cream);
+  color: var(--text-main);
+  margin: 0;
+  padding: 0;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #FAF7F2;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #CBD5E1;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #94A3B8;
+}
+
+/* Reference Card Styling (Pure White, Warm Soft Border, Soft Shadow) */
+.amppulse-card {
+  background-color: #FFFFFF;
+  border: 1px solid var(--card-border);
+  border-radius: 1rem; /* 16px */
+  box-shadow: 0 2px 10px -3px rgba(0, 0, 0, 0.03);
+  transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+}
+
+.amppulse-card:hover {
+  box-shadow: 0 4px 16px -4px rgba(0, 0, 0, 0.06);
+  border-color: #E0DACF;
+}
+
+.font-mono {
+  font-family: 'JetBrains Mono', monospace;
+}
+
+/* Pill Navigation Tabs */
+.pill-tab {
+  border-radius: 9999px;
+  padding: 0.5rem 1.25rem;
+  font-weight: 700;
+  font-size: 0.875rem;
+  color: #64748B;
+  transition: all 0.2s ease;
+}
+
+.pill-tab:hover {
+  color: #0F172A;
+  background-color: rgba(15, 23, 42, 0.05);
+}
+
+.pill-tab.active {
+  background-color: #0F172A;
+  color: #FFFFFF;
+  box-shadow: 0 4px 12px rgba(15, 23, 42, 0.15);
+}
+
+/* Circular Gauge styling matching reference timer dial */
+.gauge-circle-bg {
+  fill: none;
+  stroke: #F1ECE1;
+  stroke-width: 8;
+}
+
+.gauge-circle-progress {
+  fill: none;
+  stroke-width: 8;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.8s ease, stroke 0.4s ease;
+}
+
+/* Badge styles matching warm light theme */
+.badge-cyan {
+  background-color: #E0F2FE;
+  color: #0369A1;
+  border: 1px solid #BAE6FD;
+}
+
+.badge-emerald {
+  background-color: #ECFDF5;
+  color: #059669;
+  border: 1px solid #A7F3D0;
+}
+
+.badge-amber {
+  background-color: #FEF3C7;
+  color: #D97706;
+  border: 1px solid #FDE68A;
+}
+
+.badge-crimson {
+  background-color: #FEE2E2;
+  color: #DC2626;
+  border: 1px solid #FECACA;
+}
+
+/* Heartbeat pulse animation */
+@keyframes pulse-dot {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.15); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.8; }
+}
+
+.animate-pulse-fast {
+  animation: pulse-dot 1.5s infinite ease-in-out;
+}
