@@ -566,12 +566,13 @@ function disconnectESP32Hardware() {
 }
 
 function processIncomingESP32Packet(data) {
-  // Extract telemetry values
-  if (data.voltage !== undefined) appState.voltage = parseFloat(data.voltage);
-  if (data.current !== undefined) appState.baseIrms = parseFloat(data.current);
+  // Extract telemetry values from ESP32 packet (WebSocket or Firebase)
+  if (data.voltage     !== undefined) appState.voltage     = parseFloat(data.voltage);
+  if (data.current     !== undefined) appState.baseIrms    = parseFloat(data.current);
   if (data.powerFactor !== undefined) appState.powerFactor = parseFloat(data.powerFactor);
-  if (data.dailyKWh !== undefined) appState.dailyUnits = parseFloat(data.dailyKWh);
-  if (data.relayState !== undefined) {
+  if (data.dailyKWh    !== undefined) appState.dailyUnits  = parseFloat(data.dailyKWh);
+  if (data.cycleKWh    !== undefined) appState.cycleUnits  = parseFloat(data.cycleKWh);
+  if (data.relayState  !== undefined) {
     appState.relayClosed = Boolean(data.relayState);
     updateRelayUIState();
   }
@@ -581,12 +582,19 @@ function processIncomingESP32Packet(data) {
   if (diagVolt) diagVolt.textContent = `${appState.voltage.toFixed(1)} V AC`;
 
   const diagWifi = document.getElementById('diagWifi');
-  if (diagWifi && data.rssi) diagWifi.textContent = `${data.rssi} dBm`;
+  if (diagWifi && data.rssi !== undefined) diagWifi.textContent = `${data.rssi} dBm`;
+
+  const diagGateway = document.getElementById('diagGateway');
+  if (diagGateway) {
+    diagGateway.textContent = appState.hardwareMode === 'firebase'
+      ? 'Firebase RTDB / amppulse-651f2'
+      : 'WebSocket / Port 81';
+  }
 
   const calculatedPower = (appState.voltage * appState.baseIrms * appState.powerFactor).toFixed(1);
-  appendSensorLogCustom(`[LIVE HARDWARE] P=${calculatedPower}W | V=${appState.voltage}V | I=${appState.baseIrms.toFixed(2)}A | Usage=${appState.dailyUnits.toFixed(2)} kWh`);
+  pushLiveChartData(calculatedPower);
 
-  // Trigger metrics update
+  // Trigger full metrics update
   updateMetricsAndAdvisor();
 }
 
@@ -610,6 +618,11 @@ function injectTestHardwarePacket() {
 // FIREBASE REALTIME DATABASE CLOUD INTEGRATION
 // ======================================================================
 
+// Firebase Database Paths (must match ESP32 firmware #defines)
+const FB_PATH_LIVE    = 'sensor_readings';          // Live snapshot from ESP32
+const FB_PATH_HISTORY = 'sensor_history';           // Appended history log
+const FB_PATH_CMD     = 'sensor_readings/command';  // Relay command write path
+
 function connectFirebaseCloud() {
   if (!window.firebaseDb) {
     logDemoEvent("Firebase SDK missing or internet disconnected.");
@@ -622,31 +635,45 @@ function connectFirebaseCloud() {
     return;
   }
 
-  logDemoEvent("Connecting to Firebase Realtime Database (amppulse-651f2)...");
+  logDemoEvent("🔥 Connecting to Firebase Realtime Database (amppulse-651f2)...");
   appState.hardwareMode = 'firebase';
   updateHardwareUIState('FIREBASE_CONNECTED');
 
-  const telemetryRef = window.firebaseDb.ref('telemetry/ESP32_HOME_MAIN_01');
-  telemetryRef.on('value', (snapshot) => {
+  // Listen to /sensor_readings — ESP32 overwrites this every 5s
+  const liveRef = window.firebaseDb.ref(FB_PATH_LIVE);
+  liveRef.on('value', (snapshot) => {
     const data = snapshot.val();
-    if (data) {
+    if (data && data.device_id) {
+      // Only process if it's real device data (not just the command sub-key)
       processIncomingESP32Packet(data);
+      appendSensorLogCustom(
+        `[FIREBASE LIVE] P=${parseFloat(data.power || 0).toFixed(1)}W | ` +
+        `V=${parseFloat(data.voltage || 0).toFixed(1)}V | ` +
+        `I=${parseFloat(data.current || 0).toFixed(2)}A | ` +
+        `Cycle=${parseFloat(data.cycleKWh || 0).toFixed(1)} kWh`
+      );
+    } else if (!data) {
+      appendSensorLogCustom("[FIREBASE] Waiting for ESP32 to send first reading...");
     }
   });
 
+  // Stop simulation so real data takes over
   if (simulationInterval) {
     clearInterval(simulationInterval);
     simulationInterval = null;
   }
+
+  appendSensorLogCustom("[FIREBASE] ✅ Listening on /sensor_readings — waiting for ESP32 data stream.");
 }
 
 function disconnectFirebaseCloud() {
   if (window.firebaseDb) {
-    window.firebaseDb.ref('telemetry/ESP32_HOME_MAIN_01').off();
+    window.firebaseDb.ref(FB_PATH_LIVE).off();
   }
   appState.hardwareMode = 'simulation';
   updateHardwareUIState('DISCONNECTED');
   logDemoEvent("Disconnected from Firebase Cloud. Baseline simulation active.");
+  appendSensorLogCustom("[FIREBASE] Disconnected. Reverting to simulation engine.");
   if (!simulationInterval) {
     startSimulationEngine();
   }
@@ -730,13 +757,15 @@ function toggleSafetyRelay() {
 
   // Transmit command to Firebase Realtime Database Cloud if active
   if (appState.hardwareMode === 'firebase' && window.firebaseDb) {
-    window.firebaseDb.ref('telemetry/ESP32_HOME_MAIN_01/relayState').set(appState.relayClosed);
-    window.firebaseDb.ref('telemetry/ESP32_HOME_MAIN_01/command').set({
+    // Update relay state in live snapshot
+    window.firebaseDb.ref(FB_PATH_LIVE + '/relayState').set(appState.relayClosed);
+    // Write relay command to the path the ESP32 firmware streams from
+    window.firebaseDb.ref(FB_PATH_CMD).set({
       action: "TOGGLE_RELAY",
       state: appState.relayClosed,
       timestamp: Date.now()
     });
-    logDemoEvent(`[FIREBASE CLOUD] Relay command saved to Realtime DB: ${appState.relayClosed ? 'POWER ON' : 'TRIP CUTOFF'}`);
+    logDemoEvent(`[FIREBASE CLOUD] Relay command → /sensor_readings/command: ${appState.relayClosed ? 'POWER ON' : 'TRIP CUTOFF'}`);
   }
 
   updateRelayUIState();

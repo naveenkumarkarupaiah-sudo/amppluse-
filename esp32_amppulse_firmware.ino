@@ -1,148 +1,403 @@
-/**
- * AmpPulse Smart Energy Monitoring & TANGEDCO 500-Unit Protection System
- * ESP32 Hardware Firmware (Arduino C++)
- * 
- * Hardware Setup:
- * - ESP32 Development Board (ESP-WROOM-32)
- * - AC Energy Sensor: PZEM-004T v3.0 (UART TX2 -> ESP32 GPIO 16, RX2 -> ESP32 GPIO 17)
- *   OR SCT-013 CT Clamp (Analog GPIO 34) + ZMPT101B Voltage Sensor (Analog GPIO 35)
- * - 5V Safety Power Relay Module: Signal -> ESP32 GPIO 26
- * 
- * Libraries Required (Install via Arduino Library Manager):
- * - ESPAsyncWebServer (https://github.com/me-no-dev/ESPAsyncWebServer)
- * - AsyncTCP (for ESP32)
- * - ArduinoJson
- * - PZEM004Tv30 (Optional if using PZEM sensor module)
+﻿/**
+ * ============================================================
+ *  AmpPulse — Smart Energy Monitor
+ *  ESP32 Firmware: Firebase + I2C 16x2 LCD Edition
+ * ============================================================
+ *
+ *  WIRING GUIDE
+ *  ---------------------------------------------------------
+ *  I2C LCD 16x2 (PCF8574 backpack)
+ *    VCC  -> ESP32 3.3V  (or 5V if LCD backlight is dim)
+ *    GND  -> ESP32 GND
+ *    SDA  -> ESP32 GPIO 21
+ *    SCL  -> ESP32 GPIO 22
+ *
+ *  Safety Relay Module (5V active-HIGH)
+ *    Signal -> ESP32 GPIO 26
+ *    VCC    -> ESP32 VIN (5V)
+ *    GND    -> ESP32 GND
+ *
+ *  PZEM-004T v3 Energy Sensor (optional - currently simulated)
+ *    TX -> ESP32 GPIO 16 (RX2)
+ *    RX -> ESP32 GPIO 17 (TX2)
+ *    VCC -> 5V, GND -> GND
+ *
+ *  LIBRARIES TO INSTALL (Arduino IDE -> Manage Libraries)
+ *  ---------------------------------------------------------
+ *  1. "Firebase ESP Client"   by Mobizt
+ *  2. "LiquidCrystal I2C"     by Frank de Brabander
+ *  3. "ArduinoJson"           by Benoit Blanchon
+ * ============================================================
  */
 
+// ============================================================
+//  USER CONFIGURATION - EDIT THESE VALUES
+// ============================================================
+#define WIFI_SSID        "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD    "YOUR_WIFI_PASSWORD"
+#define FIREBASE_HOST    "amppulse-651f2-default-rtdb.firebaseio.com"
+#define FIREBASE_AUTH    "YOUR_DATABASE_SECRET"
+
+// LCD I2C address - try 0x27 first, if blank screen try 0x3F
+#define LCD_I2C_ADDR     0x27
+#define LCD_COLS         16
+#define LCD_ROWS         2
+
+// Intervals
+#define TELEMETRY_MS     5000    // Push to Firebase every 5 seconds
+#define LCD_ROTATE_MS    3000    // Change LCD screen every 3 seconds
+
+// ============================================================
+//  INCLUDES
+// ============================================================
 #include <WiFi.h>
-#include <ESPAsyncWebServer.h>
-#include <AsyncTCP.h>
+#include <FirebaseESP32.h>
+#include <addons/TokenHelper.h>
+#include <addons/RTDBHelper.h>
+#include <LiquidCrystal_I2C.h>
 #include <ArduinoJson.h>
 
-// ======================================================================
-// CONFIGURATION (ENTER YOUR WI-FI CREDENTIALS HERE)
-// ======================================================================
-const char* WIFI_SSID = "YOUR_WIFI_SSID";
-const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+// ============================================================
+//  PIN DEFINITIONS
+// ============================================================
+#define RELAY_PIN        26    // Safety relay signal pin
+#define PZEM_RX_PIN      16    // ESP32 RX2 <- PZEM TX
+#define PZEM_TX_PIN      17    // ESP32 TX2 -> PZEM RX
 
-// Hardware Pins
-#define RELAY_PIN 26
-#define CT_ANALOG_PIN 34
-#define VOLTAGE_ANALOG_PIN 35
+// ============================================================
+//  OBJECTS
+// ============================================================
+LiquidCrystal_I2C lcd(LCD_I2C_ADDR, LCD_COLS, LCD_ROWS);
 
-// WebSockets Server running on Port 81
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+FirebaseData   fbdo;
+FirebaseData   fbStream;
+FirebaseAuth   auth;
+FirebaseConfig fbConfig;
 
-// System State Variables
-bool relayState = true;           // True = Power ON, False = Relay Tripped
-float liveVoltage = 230.2;        // AC Grid Voltage (V)
-float liveCurrent = 4.35;         // Current Draw (A)
-float powerFactor = 0.96;         // Power Factor
-float accumulatedKWh = 4.25;      // Daily kWh usage accumulated
-unsigned long lastSensorRead = 0;
+// ============================================================
+//  SYSTEM STATE
+// ============================================================
+bool  relayState    = true;
+float liveVoltage   = 230.0;
+float liveCurrent   = 4.35;
+float powerFactor   = 0.96;
+float livePower     = 0.0;
+float dailyKWh      = 4.25;
+float cycleKWh      = 342.5;
+int   lcdScreen     = 0;
+bool  firebaseReady = false;
+bool  wifiConnected = false;
 
-// Send JSON telemetry to all connected WebSocket dashboard clients
-void broadcastTelemetry() {
-  StaticJsonDocument<256> doc;
-  doc["device_id"] = "ESP32_HOME_MAIN_01";
-  doc["voltage"] = String(liveVoltage, 1).toFloat();
-  doc["current"] = String(liveCurrent, 2).toFloat();
-  doc["power"] = String(liveVoltage * liveCurrent * powerFactor, 1).toFloat();
-  doc["powerFactor"] = powerFactor;
-  doc["dailyKWh"] = String(accumulatedKWh, 2).toFloat();
-  doc["relayState"] = relayState;
-  doc["rssi"] = WiFi.RSSI();
+unsigned long lastTelemetry = 0;
+unsigned long lastLcdRotate = 0;
 
-  String jsonString;
-  serializeJson(doc, jsonString);
+// ============================================================
+//  CUSTOM LCD CHARACTERS
+// ============================================================
+byte boltChar[8] = {
+  0b00100, 0b01000, 0b11110, 0b00100,
+  0b01111, 0b00010, 0b00100, 0b00000
+};
+byte wifiChar[8] = {
+  0b00000, 0b01110, 0b10001, 0b00100,
+  0b01010, 0b00000, 0b00100, 0b00000
+};
+byte degChar[8] = {
+  0b01100, 0b10010, 0b10010, 0b01100,
+  0b00000, 0b00000, 0b00000, 0b00000
+};
 
-  ws.textAll(jsonString);
-  Serial.print("[ESP32 Broadcast] ");
-  Serial.println(jsonString);
+// ============================================================
+//  SENSOR READING
+//  To use real PZEM-004T, replace the jitter block with:
+//    #include <PZEM004Tv30.h>
+//    PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
+//    liveVoltage = pzem.voltage();
+//    liveCurrent = pzem.current();
+//    powerFactor = pzem.pf();
+//    dailyKWh    = pzem.energy();
+// ============================================================
+void readSensors() {
+  if (!relayState) {
+    liveCurrent = 0.0f;
+    livePower   = 0.0f;
+    return;
+  }
+
+  // Simulated sensor jitter
+  float iJitter = ((float)random(-15, 15)) / 100.0f;
+  float vJitter = ((float)random(-10, 10)) / 10.0f;
+
+  liveCurrent = max(0.1f, 4.35f + iJitter);
+  liveVoltage = 230.0f + vJitter;
+  livePower   = liveVoltage * liveCurrent * powerFactor;
+
+  float addedKWh = (livePower / 1000.0f) * ((float)TELEMETRY_MS / 3600000.0f);
+  dailyKWh += addedKWh;
+  cycleKWh += addedKWh;
 }
 
-// WebSocket Event Handler (Receives commands from AmpPulse Dashboard)
-void onWsEvent(AsyncWebSocket *server, AsyncWebSocketClient *client, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  if (type == WS_EVT_CONNECT) {
-    Serial.printf("[WebSocket] Client #%u connected from %s\n", client->id(), client->remoteIP().toString().c_str());
-    // Send immediate telemetry update upon connection
-    broadcastTelemetry();
-  } else if (type == WS_EVT_DISCONNECT) {
-    Serial.printf("[WebSocket] Client #%u disconnected\n", client->id());
-  } else if (type == WS_EVT_DATA) {
-    AwsFrameInfo *info = (AwsFrameInfo*)arg;
-    if (info->final && info->index == 0 && info->len == len && info->opcode == WS_TEXT) {
-      data[len] = 0;
-      Serial.printf("[WebSocket Received] %s\n", (char*)data);
+// ============================================================
+//  LCD SCREENS (5 rotating screens)
+// ============================================================
+void updateLCD() {
+  lcd.clear();
 
-      StaticJsonDocument<200> doc;
-      DeserializationError error = deserializeJson(doc, (char*)data);
-      if (!error) {
-        const char* action = doc["action"];
-        if (action && strcmp(action, "TOGGLE_RELAY") == 0) {
-          relayState = !relayState;
-          digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
-          Serial.printf("[RELAY] State changed to %s\n", relayState ? "CONNECTED (ON)" : "TRIPPED (OFF)");
-          broadcastTelemetry();
-        }
-      }
+  switch (lcdScreen) {
+
+    case 0:  // Voltage
+      lcd.setCursor(0, 0);
+      lcd.write(0);  // bolt icon
+      lcd.print(" VOLTAGE");
+      lcd.setCursor(0, 1);
+      lcd.print("  ");
+      lcd.print(liveVoltage, 1);
+      lcd.print(" V AC   ");
+      break;
+
+    case 1:  // Current
+      lcd.setCursor(0, 0);
+      lcd.write(0);
+      lcd.print(" CURRENT");
+      lcd.setCursor(0, 1);
+      lcd.print("  ");
+      lcd.print(liveCurrent, 2);
+      lcd.print(" A      ");
+      break;
+
+    case 2:  // Power
+      lcd.setCursor(0, 0);
+      lcd.write(0);
+      lcd.print(" POWER");
+      lcd.setCursor(0, 1);
+      lcd.print("  ");
+      lcd.print(livePower, 1);
+      lcd.print(" W    ");
+      break;
+
+    case 3:  // kWh usage
+      lcd.setCursor(0, 0);
+      lcd.print("Today:");
+      lcd.print(dailyKWh, 3);
+      lcd.print("kWh");
+      lcd.setCursor(0, 1);
+      lcd.print("Cycle:");
+      lcd.print(cycleKWh, 1);
+      lcd.print(" kWh");
+      break;
+
+    case 4:  // Status
+      lcd.setCursor(0, 0);
+      lcd.print("Relay:");
+      lcd.print(relayState ? "ON SAFE " : "OFF TRIP");
+      lcd.setCursor(0, 1);
+      lcd.write(1);  // wifi icon
+      lcd.print(wifiConnected ? " Cloud OK" : " No WiFi ");
+      break;
+  }
+}
+
+void rotateLCDScreen() {
+  lcdScreen = (lcdScreen + 1) % 5;
+  updateLCD();
+}
+
+// ============================================================
+//  FIREBASE PUSH
+// ============================================================
+void pushToFirebase() {
+  if (!firebaseReady || !Firebase.ready()) {
+    Serial.println("[Firebase] Not ready - skipping push.");
+    return;
+  }
+
+  long tsNow = (long)millis();
+
+  // 1. Live snapshot (overwrite)
+  FirebaseJson liveJson;
+  liveJson.set("device_id",   "ESP32_HOME_MAIN_01");
+  liveJson.set("voltage",     liveVoltage);
+  liveJson.set("current",     liveCurrent);
+  liveJson.set("power",       livePower);
+  liveJson.set("powerFactor", powerFactor);
+  liveJson.set("dailyKWh",    dailyKWh);
+  liveJson.set("cycleKWh",    cycleKWh);
+  liveJson.set("relayState",  relayState);
+  liveJson.set("rssi",        (int)WiFi.RSSI());
+  liveJson.set("timestamp",   tsNow);
+
+  if (Firebase.setJSON(fbdo, "/sensor_readings", liveJson)) {
+    Serial.printf("[Firebase] OK Live: P=%.1fW V=%.1fV I=%.2fA\n",
+                  livePower, liveVoltage, liveCurrent);
+  } else {
+    Serial.printf("[Firebase] FAIL Live: %s\n", fbdo.errorReason().c_str());
+  }
+
+  // 2. History log (append)
+  FirebaseJson histJson;
+  histJson.set("voltage",    liveVoltage);
+  histJson.set("current",    liveCurrent);
+  histJson.set("power",      livePower);
+  histJson.set("dailyKWh",   dailyKWh);
+  histJson.set("cycleKWh",   cycleKWh);
+  histJson.set("relayState", relayState);
+  histJson.set("timestamp",  tsNow);
+
+  if (Firebase.pushJSON(fbdo, "/sensor_history", histJson)) {
+    Serial.println("[Firebase] OK History appended.");
+  } else {
+    Serial.printf("[Firebase] FAIL History: %s\n", fbdo.errorReason().c_str());
+  }
+}
+
+// ============================================================
+//  FIREBASE STREAM: Relay command from dashboard
+// ============================================================
+void streamCallback(StreamData data) {
+  if (data.dataType() == "json") {
+    FirebaseJson &json = data.jsonObject();
+    FirebaseJsonData actionData, stateData;
+    json.get(actionData, "action");
+    json.get(stateData,  "state");
+
+    if (actionData.success && actionData.stringValue == "TOGGLE_RELAY") {
+      relayState = stateData.success ? stateData.boolValue : !relayState;
+      digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+      Serial.printf("[RELAY] %s via dashboard\n",
+                    relayState ? "ON" : "OFF");
+
+      // Show relay status on LCD for 2s
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Dashboard CMD:  ");
+      lcd.setCursor(0, 1);
+      lcd.print("Relay: ");
+      lcd.print(relayState ? "ON  SAFE" : "OFF TRIP");
+      delay(2000);
     }
   }
 }
 
-// Read physical sensors (PZEM-004T or analog CT clamp)
-void readSensors() {
-  // Demo simulation jitter for analog inputs (Replace with actual PZEM-004T or EmonLib reads)
-  if (relayState) {
-    float jitter = ((float)random(-15, 15)) / 100.0;
-    liveCurrent = max(0.1f, 4.35f + jitter);
-    liveVoltage = 230.0f + (((float)random(-10, 10)) / 10.0f);
-    
-    // Accumulate kWh (sampled every 2 seconds)
-    float addedkWh = ((liveCurrent * liveVoltage * powerFactor) / 1000.0f) * (2.0f / 3600.0f);
-    accumulatedKWh += addedkWh;
-  } else {
-    liveCurrent = 0.0f;
-  }
+void streamTimeoutCallback(bool timeout) {
+  if (timeout) Serial.println("[Stream] Timeout - reconnecting...");
 }
 
+// ============================================================
+//  SETUP
+// ============================================================
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n--- AmpPulse ESP32 Smart Energy Controller ---");
+  Serial.println("\n=== AmpPulse ESP32 | Firebase + LCD Edition ===");
 
+  // Relay
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, relayState ? HIGH : LOW);
+  digitalWrite(RELAY_PIN, HIGH);
 
-  // Connect to Wi-Fi
-by   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
+  // LCD Init
+  lcd.init();
+  lcd.backlight();
+  lcd.createChar(0, boltChar);
+  lcd.createChar(1, wifiChar);
+  lcd.createChar(2, degChar);
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("  AmpPulse v1.0 ");
+  lcd.setCursor(0, 1);
+  lcd.print(" Smart Meter... ");
+  delay(1500);
+
+  // WiFi Connect
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("WiFi Connecting ");
+  lcd.setCursor(0, 1);
+  lcd.print(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("[Wi-Fi] Connecting");
+
+  int retries = 0;
+  while (WiFi.status() != WL_CONNECTED && retries < 30) {
     delay(500);
     Serial.print(".");
+    retries++;
   }
 
-  Serial.println("\n[Wi-Fi] Connected Successfully!");
-  Serial.print("[Wi-Fi] ESP32 IP Address: ");
-  Serial.println(WiFi.localIP());
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println("\n[Wi-Fi] Connected!");
+    Serial.print("[Wi-Fi] IP: ");
+    Serial.println(WiFi.localIP());
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi Connected! ");
+    lcd.setCursor(0, 1);
+    lcd.print(WiFi.localIP());
+    delay(2000);
+  } else {
+    Serial.println("\n[Wi-Fi] FAILED. Check credentials.");
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("WiFi FAILED!    ");
+    lcd.setCursor(0, 1);
+    lcd.print("Check SSID/PASS ");
+    delay(3000);
+  }
 
-  // Attach WebSocket handler & Start Async HTTP Server
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
-  server.begin();
-  Serial.println("[HTTP/WS] Server active on port 80/81 (/ws)");
+  // Firebase Init
+  if (wifiConnected) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Firebase Init...");
+
+    fbConfig.host                        = FIREBASE_HOST;
+    fbConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
+    fbConfig.token_status_callback      = tokenStatusCallback;
+
+    Firebase.begin(&fbConfig, &auth);
+    Firebase.reconnectWiFi(true);
+    Firebase.setReadTimeout(fbdo, 1000 * 60);
+    Firebase.setwriteSizeLimit(fbdo, "tiny");
+
+    if (!Firebase.beginStream(fbStream, "/sensor_readings/command")) {
+      Serial.printf("[Stream] Begin failed: %s\n", fbStream.errorReason().c_str());
+    }
+    Firebase.setStreamCallback(fbStream, streamCallback, streamTimeoutCallback);
+
+    firebaseReady = true;
+    Serial.println("[Firebase] Ready!");
+
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Firebase Ready! ");
+    lcd.setCursor(0, 1);
+    lcd.print("amppulse-651f2  ");
+    delay(2000);
+  }
+
+  // First read + LCD
+  readSensors();
+  updateLCD();
+  Serial.println("[System] Running. Pushing every 5s, LCD rotating every 3s.");
 }
 
+// ============================================================
+//  LOOP
+// ============================================================
 void loop() {
-  ws.cleanupClients();
+  unsigned long now = millis();
 
-  // Read sensors & broadcast every 2 seconds
-  if (millis() - lastSensorRead >= 2000) {
-    lastSensorRead = millis();
+  // Push sensor data to Firebase every 5s
+  if (now - lastTelemetry >= TELEMETRY_MS) {
+    lastTelemetry = now;
     readSensors();
-    if (ws.count() > 0) {
-      broadcastTelemetry();
-    }
+    pushToFirebase();
+  }
+
+  // Rotate LCD screen every 3s
+  if (now - lastLcdRotate >= LCD_ROTATE_MS) {
+    lastLcdRotate = now;
+    rotateLCDScreen();
   }
 }
